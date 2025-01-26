@@ -1,7 +1,9 @@
 <?php
+
 namespace App\Http\Controllers;
 
 require_once(base_path('/plugin/2checkout-php-sdk/autoloader.php'));
+
 use Illuminate\Http\Request;
 use Tco\Examples\Common;
 use Tco\TwocheckoutFacade;
@@ -9,9 +11,80 @@ use Exception;
 
 class PaymentController extends Controller
 {
+    /**
+     * Display the payment page.
+     *
+     * @return \Illuminate\View\View
+     */
+    public function index()
+    {
+        return view('payment');
+    }
 
-    function index() {
-        return view('payment'); 
+    /**
+     * Get 2Checkout API configuration.
+     *
+     * @return array
+     */
+    private function getTcoConfig(): array
+    {
+        return [
+            'sellerId'          => '255367460000', // From .env file
+            'secretKey'         => 'DfKI|0+mCF~t3!w@k=gQ', // From .env file
+            'buyLinkSecretWord' => env('TCO_BUY_LINK_SECRET_WORD', ''),
+            'jwtExpireTime'     => 30,
+            'curlVerifySsl'     => true,
+        ];
+    }
+
+    /**
+     * Generate dynamic order array.
+     *
+     * @param array $overrides
+     * @return array
+     */
+    private function generateOrderArray(array $overrides = []): array
+    {
+        $defaultOrder = [
+            'Country'           => 'US',
+            'Currency'          => 'USD',
+            'CustomerIP'        => request()->ip(),
+            'ExternalReference' => 'CustOrd' . now()->timestamp,
+            'Language'          => 'en',
+            'BillingDetails'    => [
+                'Address1'    => 'Street 1',
+                'City'        => 'Cleveland',
+                'State'       => 'Ohio',
+                'CountryCode' => 'US',
+                'Email'       => 'testcustomer@2Checkout.com',
+                'FirstName'   => 'John',
+                'LastName'    => 'Doe',
+                'Zip'         => '20034',
+            ],
+            'Items'             => [
+                [
+                    'Name'         => 'Colored Pencil',
+                    'Description'  => 'Test description',
+                    'Quantity'     => 1,
+                    'IsDynamic'    => true,
+                    'Tangible'     => false,
+                    'PurchaseType' => 'PRODUCT',
+                    'Price'        => [
+                        'Amount' => 2,
+                        'Type'   => 'CUSTOM',
+                    ],
+                ],
+            ],
+            'PaymentDetails'    => [
+                'Currency'      => 'USD',
+                'CustomerIP'    => request()->ip(),
+                'PaymentMethod' => [
+                    'RecurringEnabled' => false,
+                ],
+            ],
+        ];
+
+        return array_replace_recursive($defaultOrder, $overrides);
     }
 
     /**
@@ -28,69 +101,36 @@ class PaymentController extends Controller
             'useCore'   => 'required',
         ]);
 
-        $orderParams   = new Common\OrderParams\DynamicProducts();
-        $exampleConfig = [
-            'sellerId'      => '255367460000', // REQUIRED
-            'secretKey'     => 'DfKI|0+mCF~t3!w@k=gQ', // REQUIRED
-            'buyLinkSecretWord'    => '',
-            'jwtExpireTime' => 30,
-            'curlVerifySsl' => 1
-        ];
-        $result        = null;
+        $tco = new TwocheckoutFacade($this->getTcoConfig());
 
         try {
-            $tco        = new TwocheckoutFacade($exampleConfig);
-            $token      = $validated['ess_token'];
-            $testMode   = $validated['testMode'];
-            $useCore    = $validated['useCore'];
+            $predefinedDynamicOrderParams = $this->generateOrderArray([
+                'PaymentDetails' => $this->getPaymentDetailsWith3DsUrls(
+                    $validated['ess_token'],
+                    $validated['testMode']
+                ),
+            ]);
 
-            $predefinedDynamicOrderParams = $orderParams->getDynamicProductSuccessParams();
-            $originalPaymentDetails       = $predefinedDynamicOrderParams['PaymentDetails'];
+            $response = $validated['useCore']
+                ? $tco->apiCore()->call('/orders/', $predefinedDynamicOrderParams)
+                : $tco->order()->place($predefinedDynamicOrderParams);
 
-            $newPaymentDetails = $this->getPaymentDetailsWith3DsUrls($token, $testMode);
-            $mergedPaymentDetails = array_merge_recursive($originalPaymentDetails, $newPaymentDetails);
-
-            $predefinedDynamicOrderParams['PaymentDetails'] = $mergedPaymentDetails;
-
-            // Place the order via API or Core API
-            if (!$useCore) {
-                $response = $tco->order()->place($predefinedDynamicOrderParams);
-            } else {
-                $response = $tco->apiCore()->call('/orders/', $predefinedDynamicOrderParams);
+            if (isset($response['Errors']) && !empty($response['Errors'])) {
+                return $this->errorResponse(implode(PHP_EOL, $response['Errors']));
             }
 
-            // Handle API response
-            if (!isset($response['RefNo'])) {
-                $result = [
-                    'success' => false,
-                    'errors'  => $response['message'] ?? 'An unknown error occurred.',
-                ];
-            } elseif (isset($response['Errors']) && !empty($response['Errors'])) {
-                $errorMessage = implode(PHP_EOL, $response['Errors']);
-                $result = [
-                    'success' => false,
-                    'error'   => $errorMessage,
-                ];
-            } else {
-                $hasAuthorize3ds = $response['PaymentDetails']['PaymentMethod']['Authorize3DS'] ?? false;
-                $redirectTo = $hasAuthorize3ds ? $this->hasAuthorize3DS($hasAuthorize3ds) : route('payment.success', [
-                    'refno' => $response['RefNo'],
-                ]);
+            $redirectTo = isset($response['PaymentDetails']['PaymentMethod']['Authorize3DS'])
+                ? $this->extract3DSUrl($response['PaymentDetails']['PaymentMethod']['Authorize3DS'])
+                : route('payment.success', ['refno' => $response['RefNo']]);
 
-                $result = [
-                    'success'  => true,
-                    'refno'    => $response['RefNo'],
-                    'redirect' => $redirectTo,
-                ];
-            }
+            return response()->json([
+                'success'  => true,
+                'refno'    => $response['RefNo'],
+                'redirect' => $redirectTo,
+            ]);
         } catch (Exception $exception) {
-            $result = [
-                'success' => false,
-                'errors'  => $exception->getMessage(),
-            ];
+            return $this->errorResponse($exception->getMessage());
         }
-
-        return response()->json($result);
     }
 
     /**
@@ -135,32 +175,40 @@ class PaymentController extends Controller
      * @param array $has3ds
      * @return string|null
      */
-    private function hasAuthorize3DS(array $has3ds): ?string
+    private function extract3DSUrl(array $has3ds): ?string
     {
-        if (isset($has3ds['Href']) && !empty($has3ds['Href'])) {
-            return $has3ds['Href'] . '?avng8apitoken=' . ($has3ds['Params']['avng8apitoken'] ?? '');
-        }
-
-        return null;
+        return $has3ds['Href'] . '?avng8apitoken=' . ($has3ds['Params']['avng8apitoken'] ?? '');
     }
 
-    function success(Request $request){
-        $exampleConfig = [
-            'sellerId'      => '255367460000', // REQUIRED
-            'secretKey'     => 'DfKI|0+mCF~t3!w@k=gQ', // REQUIRED
-            'buyLinkSecretWord'    => '',
-            'jwtExpireTime' => 30,
-            'curlVerifySsl' => 1
-        ];
+    /**
+     * Error response helper.
+     *
+     * @param string $message
+     * @return \Illuminate\Http\JsonResponse
+     */
+    private function errorResponse(string $message)
+    {
+        return response()->json([
+            'success' => false,
+            'errors'  => $message,
+        ]);
+    }
 
-        $tco = new TwocheckoutFacade($exampleConfig);
+    /**
+     * Handles payment success callback.
+     *
+     * @param Request $request
+     * @return void
+     */
+    public function success(Request $request)
+    {
+        $tco = new TwocheckoutFacade($this->getTcoConfig());
 
         try {
             $response = $tco->order()->getOrder(['RefNo' => $request->refno]);
             dd($response);
         } catch (Exception $e) {
             throw $e;
-            return null;
-        } 
+        }
     }
 }
